@@ -1,0 +1,214 @@
+'use client'
+import { useEffect, useState } from 'react'
+import { useRouter } from 'next/navigation'
+import Navbar from '../../components/Navbar'
+import CodeBlock from '../../components/CodeBlock'
+import ConfidenceMeter from '../../components/ConfidenceMeter'
+
+export default function AnalyzePage() {
+  const router = useRouter()
+  const [data, setData] = useState(null)
+
+  // Fix feature states
+  // const [fixing, setFixing] = useState(false)
+  // const [fixResult, setFixResult] = useState(null)
+  // const [fixError, setFixError] = useState('')
+
+  // PR states
+  // const [creatingPR, setCreatingPR] = useState(false)
+  // const [prResult, setPrResult] = useState(null)
+  // const [prError, setPrError] = useState('')
+
+  useEffect(() => {
+    const stored = localStorage.getItem('repomedic_analysis')
+    if (!stored) { router.push('/'); return }
+    setData(JSON.parse(stored))
+  }, [])
+
+const handleFix = async () => {
+  setFixing(true)
+  setFixError('')
+  setFixResult(null)
+  setPrResult(null)
+  try {
+    const affectedFile = (data.affectedFiles || [])[0] || ''
+    const language = affectedFile.endsWith('.py') ? 'python'
+      : affectedFile.endsWith('.ts') ? 'typescript'
+      : affectedFile.endsWith('.js') ? 'javascript'
+      : 'python'
+
+    // Fetch actual file content from GitHub
+    let fileContent = ''
+if (affectedFile && data.repoUrl) {
+  try {
+    const repoPath = data.repoUrl.replace('https://github.com/', '')
+    // try main, then master
+    for (const branch of ['main', 'master']) {
+      const rawUrl = `https://raw.githubusercontent.com/${repoPath}/${branch}/${affectedFile}`
+      const fileRes = await fetch(rawUrl)
+      if (fileRes.ok) { fileContent = await fileRes.text(); break }
+    }
+  } catch (_) {}
+}
+// fallback only if fetch completely failed
+if (!fileContent) fileContent = data.improvedCode || ''
+
+    const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/bug-fix`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        fileContent,
+        bugDescription: data.rootCause || data.bugDescription || '',
+        language
+      })
+    })
+    const result = await res.json()
+    console.log('FIX RESULT:', JSON.stringify(result, null, 2))
+    if (!res.ok) throw new Error(result.error || 'Fix failed')
+    setFixResult(result.result || result)
+  } catch (err) {
+    setFixError(err.message)
+  } finally {
+    setFixing(false)
+  }
+}
+
+  const handleCreatePR = async () => {
+    setCreatingPR(true)
+    setPrError('')
+    setPrResult(null)
+    try {
+      const filePath = (data.affectedFiles || [])[0] || 'index.js'
+      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/pr`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          repoUrl: data.repoUrl,
+          filePath,
+          fixedCode: fixResult.fixedCode,
+          bugDescription: data.bugDescription || ''
+        })
+      })
+      const result = await res.json()
+      if (!res.ok) throw new Error(result.error || 'PR creation failed')
+      setPrResult(result)
+    } catch (err) {
+      setPrError(err.message)
+    } finally {
+      setCreatingPR(false)
+    }
+  }
+
+  if (!data) return (
+    <main style={{ minHeight: '100vh', background: 'var(--bg)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+      <div style={{ width: 32, height: 32, border: '2px solid var(--border)', borderTopColor: 'var(--accent)', borderRadius: '50%', animation: 'spin 0.8s linear infinite' }} />
+    </main>
+  )
+
+  return (
+    <main style={{ minHeight: '100vh', background: 'var(--bg)' }}>
+      <Navbar />
+      <div style={{ maxWidth: 900, margin: '0 auto', padding: '90px 24px 60px' }}>
+
+        {/* Header */}
+        <div className="fade-up" style={{ marginBottom: 32 }}>
+          <button onClick={() => router.push('/')} style={{
+            background: 'none', border: 'none', color: 'var(--text3)', cursor: 'pointer',
+            fontFamily: 'var(--font-mono)', fontSize: 13, marginBottom: 16, padding: 0,
+            display: 'flex', alignItems: 'center', gap: 6
+          }}>← Back</button>
+          <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', flexWrap: 'wrap', gap: 16 }}>
+            <div>
+              <h1 style={{ fontFamily: 'var(--font-sans)', fontSize: 28, fontWeight: 800, marginBottom: 6 }}>
+                Bug Analysis Report
+              </h1>
+              <p style={{ color: 'var(--text2)', fontFamily: 'var(--font-mono)', fontSize: 13 }}>
+                {data.repoUrl?.replace('https://github.com/', '')}
+              </p>
+            </div>
+            <ConfidenceMeter confidence={data.confidence || 0} />
+          </div>
+        </div>
+
+        {/* Summary Banner */}
+        <div className="fade-up-1" style={{
+          background: 'var(--accent-dim)', border: '1px solid var(--accent)',
+          borderRadius: 12, padding: '16px 20px', marginBottom: 24,
+          display: 'flex', alignItems: 'flex-start', gap: 12
+        }}>
+          <span style={{ color: 'var(--accent)', fontSize: 18, marginTop: 1 }}>⚡</span>
+          <div>
+            <div style={{ fontSize: 11, color: 'var(--accent)', fontFamily: 'var(--font-mono)', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 4 }}>Summary</div>
+            <p style={{ color: 'var(--text)', fontFamily: 'var(--font-mono)', fontSize: 14, lineHeight: 1.6 }}>{data.summary}</p>
+          </div>
+        </div>
+
+        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, marginBottom: 16 }}>
+          {/* Root Cause */}
+          <div className="fade-up-2" style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 20 }}>
+            <div style={{ fontSize: 11, color: 'var(--text3)', fontFamily: 'var(--font-mono)', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ color: 'var(--red)' }}>●</span> Root Cause
+            </div>
+            <p style={{ color: 'var(--text)', fontFamily: 'var(--font-mono)', fontSize: 13, lineHeight: 1.7 }}>{data.rootCause}</p>
+          </div>
+
+          {/* Affected Files */}
+          <div className="fade-up-2" style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 20 }}>
+            <div style={{ fontSize: 11, color: 'var(--text3)', fontFamily: 'var(--font-mono)', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
+              <span style={{ color: 'var(--yellow)' }}>●</span> Affected Files
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {(data.affectedFiles || []).length === 0
+                ? <span style={{ color: 'var(--text3)', fontFamily: 'var(--font-mono)', fontSize: 13 }}>No specific files identified</span>
+                : (data.affectedFiles || []).map((f, i) => (
+                  <div key={i} style={{
+                    background: 'var(--bg3)', border: '1px solid var(--border)',
+                    borderRadius: 6, padding: '6px 10px', fontFamily: 'var(--font-mono)',
+                    fontSize: 12, color: 'var(--yellow)'
+                  }}>📄 {f}</div>
+                ))
+              }
+            </div>
+          </div>
+        </div>
+
+        {/* Reasoning */}
+        <div className="fade-up-3" style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 20, marginBottom: 16 }}>
+          <div style={{ fontSize: 11, color: 'var(--text3)', fontFamily: 'var(--font-mono)', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ color: 'var(--blue)' }}>●</span> AI Reasoning
+          </div>
+          <p style={{ color: 'var(--text2)', fontFamily: 'var(--font-mono)', fontSize: 13, lineHeight: 1.8 }}>{data.reasoning}</p>
+        </div>
+
+        {/* How to Fix */}
+        <div className="fade-up-3" style={{ background: 'var(--bg2)', border: '1px solid var(--border)', borderRadius: 12, padding: 20, marginBottom: 16 }}>
+          <div style={{ fontSize: 11, color: 'var(--text3)', fontFamily: 'var(--font-mono)', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8 }}>
+            <span style={{ color: 'var(--accent)' }}>●</span> How to Fix
+          </div>
+          <p style={{ color: 'var(--text)', fontFamily: 'var(--font-mono)', fontSize: 13, lineHeight: 1.8 }}>{data.fix}</p>
+        </div>
+
+        {/* Improved Code */}
+        {data.improvedCode && (
+          <div className="fade-up-4">
+            <CodeBlock code={data.improvedCode} title="Suggested Fix" />
+          </div>
+        )}
+
+
+        {/* Actions */}
+        <div className="fade-up-4" style={{ display: 'flex', gap: 12, marginTop: 24, flexWrap: 'wrap' }}>
+          <button onClick={() => router.push('/')} style={{
+            background: 'var(--accent)', color: '#000', border: 'none', borderRadius: 10,
+            padding: '12px 24px', fontWeight: 700, fontFamily: 'var(--font-sans)', cursor: 'pointer',
+            fontSize: 14, boxShadow: '0 0 20px var(--accent-glow)'
+          }}>⚡ Analyze Another Repo</button>
+          <button onClick={() => router.push('/chat')} style={{
+            background: 'var(--bg2)', color: 'var(--text)', border: '1px solid var(--border)',
+            borderRadius: 10, padding: '12px 24px', fontFamily: 'var(--font-sans)', cursor: 'pointer', fontSize: 14
+          }}>💬 Chat with Repo</button>
+        </div>
+      </div>
+    </main>
+  )
+}

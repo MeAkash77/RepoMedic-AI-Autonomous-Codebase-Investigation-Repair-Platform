@@ -1,0 +1,393 @@
+const axios = require('axios');
+
+const OPENROUTER_API_URL = 'https://openrouter.ai/api/v1/chat/completions';
+const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
+
+// Safe char budget for small free models (~8k context)
+const MAX_TOTAL_CHARS = 20000;
+
+
+// =====================================================
+// OPENROUTER
+// =====================================================
+
+const FALLBACK_MODELS = [
+  process.env.OPENROUTER_MODEL || 'google/gemma-3-12b-it',
+];
+
+const callOpenRouter = async (messages, maxTokens = 3000, temperature = 0.2) => {
+  if (!OPENROUTER_API_KEY) throw new Error('OPENROUTER_API_KEY is not configured in .env');
+
+  let lastError;
+  for (const model of FALLBACK_MODELS) {
+    try {
+      console.log(`🤖 Trying model: ${model}`);
+      const response = await axios.post(
+        OPENROUTER_API_URL,
+        { model, messages, max_tokens: maxTokens, temperature },
+        {
+          headers: {
+            Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+            'Content-Type': 'application/json',
+            'HTTP-Referer': 'https://repomedic.vercel.app',
+            'X-Title': 'RepoMedic'
+          }
+        }
+      );
+      const content = response.data?.choices?.[0]?.message?.content || '';
+      if (content) return content;
+    } catch (err) {
+      console.warn(`⚠️ Model ${model} failed:`, err.response?.data?.error?.message || err.message);
+      lastError = err;
+    }
+  }
+  throw lastError || new Error('All models failed');
+};
+
+
+// =====================================================
+// BUG ANALYSIS
+// =====================================================
+
+const analyzeBug = async (
+  parsedRepo,
+  repoContext,
+  bugDescription,
+  relevantFiles   // ranked files passed in from analyzeController
+) => {
+
+  // Use ranked relevant files; fall back to first 8 if not provided
+  const files = (relevantFiles && relevantFiles.length)
+    ? relevantFiles
+    : parsedRepo.files
+        .filter(f =>
+          !f.path.toLowerCase().endsWith('.md') &&
+          !f.path.toLowerCase().includes('readme')
+        )
+        .slice(0, 8);
+
+  // Distribute char budget evenly across files
+  const perFileBudget = Math.floor(MAX_TOTAL_CHARS / Math.max(files.length, 1));
+
+  const filesSummary = files
+    .map(file => `
+===== FILE: ${file.path} =====
+${file.content.slice(0, perFileBudget)}
+===== END FILE =====
+`)
+    .join('\n');
+
+  const prompt = `
+You are RepoMedic, an expert software debugging assistant.
+
+Your job is to analyze the user's reported bug using the ACTUAL repository
+source code provided below.
+
+IMPORTANT RULES:
+
+1. Do NOT invent code that is not present in the repository.
+2. Do NOT assume that the first few lines of a file are the complete file.
+3. Identify the actual file and code responsible for the reported bug.
+4. Explain WHY the code is wrong.
+5. If the provided code is insufficient to prove the bug, say so clearly.
+6. Do NOT rewrite unrelated code.
+7. The suggested fix must modify only the relevant part of the code.
+8. Preserve the existing programming style and logic whenever possible.
+9. Do NOT use README.md as source code.
+10. Do not claim a bug exists merely because code looks unusual.
+
+## Repository
+
+${parsedRepo.owner}/${parsedRepo.repo}
+
+## Repository Context
+
+${repoContext}
+
+## Repository Structure
+
+${parsedRepo.structure}
+
+## Source Code
+
+${filesSummary}
+
+## User Reported Bug
+
+${bugDescription}
+
+Analyze the reported bug.
+
+Return:
+
+- summary: short explanation of the actual problem
+- rootCause: why the problem happens
+- affectedFiles: exact files involved
+- reasoning: clear technical reasoning
+- fix: what should actually be changed and why
+- improvedCode: corrected code for the affected section only
+- confidence: confidence from 0 to 100
+
+If you cannot determine the exact cause from the supplied source,
+do NOT fabricate an answer. Explain what information is missing.
+
+Respond with ONLY this JSON, no markdown, no code fences, nothing else:
+{"summary":"...","rootCause":"...","affectedFiles":["..."],"reasoning":"...","fix":"...","improvedCode":"...","confidence":0}
+`;
+
+
+  const text = await callOpenRouter(
+    [
+      {
+  role: 'system',
+  content: 'You are a precise software debugging expert. Never invent repository code. You MUST respond with ONLY a valid JSON object, no markdown, no explanation, no code fences. Just raw JSON.'
+},
+      {
+        role: 'user',
+        content: prompt
+      }
+    ],
+    4000,
+    0.2,
+  );
+  console.log('🔍 RAW RESPONSE:', JSON.stringify(text?.slice(0, 500)));
+
+  const cleaned = text
+  .trim()
+  .replace(/^```json\s*/i, '')
+  .replace(/^```\s*/i, '')
+  .replace(/```\s*$/i, '')
+  .trim();
+
+try {
+  return JSON.parse(cleaned);
+} catch {
+  const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    try {
+      return JSON.parse(jsonMatch[0]);
+    } catch {}
+  }
+
+    // Last resort: regex scrape
+    const getSection = (key) => {
+      const patterns = [
+        new RegExp(`\\*\\*${key}\\*\\*[:\\s]+([^*]+?)(?=\\*\\*|##|$)`, 'is'),
+        new RegExp(`##\\s*${key}[:\\s]+([^#]+?)(?=##|$)`, 'is'),
+        new RegExp(`${key}[:\\s]+([^\\n]+)`, 'i')
+      ];
+      for (const p of patterns) {
+        const m = text.match(p);
+        if (m) return m[1].trim();
+      }
+      return '';
+    };
+
+    const filesRaw = getSection('affectedFiles');
+    const affectedFiles = filesRaw
+      ? filesRaw.split(/[,\n]/).map(f => f.replace(/[-*`]/g, '').trim()).filter(Boolean)
+      : [];
+
+    return {
+    summary: cleaned,
+    rootCause: '',
+    affectedFiles: [],
+    reasoning: '',
+    fix: '',
+    improvedCode: '',
+    confidence: 0
+  };
+  }
+};
+
+
+// =====================================================
+// CHAT WITH REPOSITORY
+// =====================================================
+
+const chatWithRepo = async (
+  parsedRepo,
+  repoContext,
+  question,
+  history = []
+) => {
+
+  const sourceFiles = parsedRepo.files
+    .filter(file =>
+      !file.path.toLowerCase().endsWith('.md') &&
+      !file.path.toLowerCase().includes('readme')
+    )
+    .slice(0, 10);
+
+  const perFileBudget = Math.floor(MAX_TOTAL_CHARS / Math.max(sourceFiles.length, 1));
+
+  const filesSummary = sourceFiles
+    .map(file => `
+===== ${file.path} =====
+${file.content.slice(0, perFileBudget)}
+===== END =====
+`)
+    .join('\n');
+
+  const messages = [
+    {
+      role: 'system',
+      content:
+        'You are RepoMedic, a helpful software engineer answering questions about the provided GitHub repository. Use only the supplied repository information and source code. Do not invent files or functionality.'
+    },
+    ...history,
+    {
+      role: 'user',
+      content: `
+Repository context:
+
+${repoContext}
+
+Repository files:
+
+${filesSummary}
+
+Question:
+
+${question}
+`
+    }
+  ];
+
+  return await callOpenRouter(messages, 2000, 0.4);
+};
+
+
+// =====================================================
+// GENERATE FIX
+// =====================================================
+
+const generateFix = async (
+  fileContent,
+  bugDescription,
+  language = 'javascript'
+) => {
+
+  // Truncate large files to stay within model context
+  const truncatedContent = fileContent.slice(0, 20000);
+
+  const prompt = `
+You are RepoMedic's code-fixing engine.
+
+Fix the reported bug in the provided source code.
+
+Programming language:
+${language}
+
+Bug to fix:
+${bugDescription}
+
+CRITICAL INSTRUCTIONS:
+1. You MUST apply the fix described in the bug description to the code below.
+2. Return the COMPLETE file with the fix already applied.
+3. Do NOT return the original unchanged code.
+4. Do NOT explain what to do — just DO it in the fixedCode.
+5. steps should describe what you changed and why.
+6. fixedCode must be the full corrected file.
+
+Source file to fix:
+${truncatedContent}
+
+Respond with ONLY this JSON, no markdown, no code fences, nothing else:
+{"steps":[{"title":"...","explanation":"...","code":"..."}],"fixedCode":"complete corrected file here"}
+`;
+
+  
+
+  const text = await callOpenRouter(
+    [
+      {
+  role: 'system', 
+  content: 'You are an expert software engineer. Respond with ONLY a valid JSON object, no markdown, no code fences. Just raw JSON matching: {"steps":[{"title":"...","explanation":"...","code":"..."}],"fixedCode":"..."}'
+},
+      {
+        role: 'user',
+        content: prompt
+      }
+    ],
+    6000,
+    0.2,
+  );
+
+  try {
+  const cleaned = text
+    .trim()
+    .replace(/^```json\s*/i, '')
+    .replace(/^```\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim();
+  return JSON.parse(cleaned);
+} catch {
+  const jsonMatch = text.match(/\{[\s\S]*\}/);
+  if (jsonMatch) {
+    try {
+      return JSON.parse(jsonMatch[0]);
+    } catch {}
+  }
+  return {
+    steps: [{ title: 'Fix', explanation: text, code: '' }],
+    fixedCode: fileContent
+  };
+}
+};
+
+
+// =====================================================
+// REPOSITORY EXPLANATION
+// =====================================================
+
+const explainRepo = async (parsedRepo, repoContext) => {
+  const readme = parsedRepo.readme || '';
+  const structure = parsedRepo.structure || '';
+
+  const prompt = `
+Explain this GitHub repository in simple English.
+
+Repository:
+
+${repoContext}
+
+README:
+
+${readme.slice(0, 1500)}
+
+File structure:
+
+${structure.slice(0, 1000)}
+
+Explain:
+
+1. What the project does
+2. Who it is for
+3. Main features
+4. Technologies used
+
+Keep it concise and easy to understand.
+Do not include source code.
+`;
+
+  return (
+    await callOpenRouter(
+      [{ role: 'user', content: prompt }],
+      800,
+      0.5
+    )
+  ).trim();
+};
+
+
+// =====================================================
+// EXPORTS
+// =====================================================
+
+module.exports = {
+  analyzeBug,
+  chatWithRepo,
+  generateFix,
+  explainRepo
+};
